@@ -1,0 +1,43 @@
+{
+  "horizon_hours": 72,
+  "model_type": "random_forest",
+  "feature_columns": [
+    "co",
+    "no",
+    "no2",
+    "o3",
+    "so2",
+    "pm2_5",
+    "pm10",
+    "nh3",
+    "aqi_change_rate",
+    "pm25_change_rate",
+    "aqi",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+    "aqi_lag_1h",
+    "aqi_lag_3h",
+    "aqi_lag_6h",
+    "aqi_lag_12h",
+    "aqi_lag_24h",
+    "aqi_lag_48h",
+    "aqi_lag_72h",
+    "aqi_rollmean_24h",
+    "aqi_rollstd_24h",
+    "aqi_rollmean_72h",
+    "aqi_rollstd_72h",
+    "aqi_rollmean_168h",
+    "aqi_rollstd_168h",
+    "pm2_5_lag_24h",
+    "pm10_lag_24h"
+  ],
+  "metrics": {
+    "rmse": 20.487982942808227,
+    "mae": 15.022499761269158,
+    "r2": 0.08093134096945076
+  }
+}

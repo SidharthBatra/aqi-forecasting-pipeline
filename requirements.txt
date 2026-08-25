@@ -1,0 +1,4 @@
+hopsworks
+confluent-kafka
+pandas
+requests

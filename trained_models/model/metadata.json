@@ -1,0 +1,33 @@
+{
+  "model_type": "Random Forest",
+  "feature_names": [
+    "hour",
+    "day",
+    "month",
+    "year",
+    "day_of_week",
+    "co",
+    "no",
+    "no2",
+    "o3",
+    "so2",
+    "pm2_5",
+    "pm10",
+    "nh3",
+    "om_pm2_5",
+    "om_pm10",
+    "om_co",
+    "om_no2",
+    "om_so2",
+    "om_o3",
+    "pm25_source_diff",
+    "aqi_change_rate",
+    "pm25_change_rate"
+  ],
+  "target": "aqi_index",
+  "metrics": {
+    "rmse": 0.01675383881690906,
+    "mae": 0.0014705412621214924,
+    "r2": 0.9995118173010321
+  }
+}
