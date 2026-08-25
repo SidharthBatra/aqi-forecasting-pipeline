@@ -1,0 +1,51 @@
+name: Hourly Feature Pipeline
+
+# Fetches the latest pollutant readings and pushes one new row into the
+# Hopsworks feature group (aqi_karachi_features) that train_model.py
+# trains from. Stateless by design -- see fetch_features.py's docstring
+# for how it reconstructs recent context from Hopsworks itself rather
+# than relying on local files, which wouldn't survive between runs here.
+#
+# Place this file at: .github/workflows/feature_pipeline.yml
+
+on:
+  schedule:
+    # Hourly, on the hour, UTC. GitHub Actions cron can run a few minutes
+    # late under load -- that's fine, fetch_openweather() just gets
+    # whatever OpenWeather's latest reading is at call time.
+    - cron: "0 * * * *"
+  workflow_dispatch: {}  # manual trigger from the Actions tab, for testing
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run feature pipeline
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          AQICN_API_TOKEN: ${{ secrets.AQICN_API_TOKEN }}
+        run: python fetch_features.py
