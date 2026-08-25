@@ -202,38 +202,46 @@ RAW_FEATURE_GROUP_VERSION = 4
 
 
 def read_source_data():
-    """Local CSV if present -- that's the Codespace/dev-loop path, and
-    stays the default so nothing about the existing interactive workflow
-    changes. Falls back to pulling the raw feature group straight from
-    Hopsworks when the CSV isn't there, which is the ONLY option in
-    GitHub Actions: runners are stateless/ephemeral, so
-    training_pipeline.yml's checkout never includes the local backfill
-    CSV (it isn't and shouldn't be committed to git -- it's tens of
-    thousands of rows that change hourly). This is what makes the daily
-    CI/CD training pipeline actually able to run unattended."""
+    """Hopsworks FIRST -- the project requirement is everything cloud-based,
+    so the Feature Store is the real source of truth and this is what
+    actually runs every time, both in CI and interactively. The local CSV
+    is a fallback ONLY: if Hopsworks is unreachable or misconfigured, we
+    fall back to whatever aqi_historical_backfill_v2.csv is committed in
+    the repo (which won't have the latest hourly-fetched rows, but keeps
+    the pipeline running rather than failing outright) rather than
+    treating the CSV as the primary path with Hopsworks as an afterthought."""
+    api_key = os.environ.get("HOPSWORKS_API_KEY")
+    if api_key:
+        try:
+            import hopsworks
+
+            print("Pulling training data from Hopsworks feature group...")
+            project = hopsworks.login(api_key_value=api_key)
+            fs = project.get_feature_store()
+            fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
+            df = fg.read()
+            df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
+            print(
+                f"Pulled {len(df)} rows from Hopsworks feature group "
+                f"{RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}."
+            )
+            return df
+        except Exception as e:
+            print(
+                f"WARNING: Hopsworks read failed ({type(e).__name__}: {e}) -- "
+                f"falling back to the local CSV if one is committed in the repo."
+            )
+    else:
+        print("HOPSWORKS_API_KEY not set -- falling back to local CSV.")
+
     if os.path.isfile(INPUT_CSV):
-        print(f"Loading local {INPUT_CSV} ...")
+        print(f"Loading local {INPUT_CSV} (fallback -- may be behind the latest hourly-fetched data)...")
         return pd.read_csv(INPUT_CSV, parse_dates=[TIMESTAMP_COL])
 
-    print(f"{INPUT_CSV} not found locally -- pulling from Hopsworks feature group instead...")
-    api_key = os.environ.get("HOPSWORKS_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            f"Neither {INPUT_CSV} nor HOPSWORKS_API_KEY is available -- "
-            f"there's no source to load training data from."
-        )
-    import hopsworks
-
-    project = hopsworks.login(api_key_value=api_key)
-    fs = project.get_feature_store()
-    fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
-    df = fg.read()
-    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
-    print(
-        f"Pulled {len(df)} rows from Hopsworks feature group "
-        f"{RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}."
+    raise RuntimeError(
+        f"Couldn't load training data from Hopsworks or from a local "
+        f"{INPUT_CSV} -- no source available."
     )
-    return df
 
 
 def load_and_prepare_grid(path=None):
