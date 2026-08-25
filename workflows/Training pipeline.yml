@@ -1,0 +1,63 @@
+name: Daily Training Pipeline
+
+# Retrains all 3 AQI forecast horizons daily and registers the best model
+# per horizon in the Hopsworks Model Registry. Runs on a fresh, stateless
+# GitHub Actions runner every time -- there's no local backfill CSV here
+# (deliberately not committed to the repo, see train_model.py's
+# read_source_data()), so this relies entirely on train_model.py's
+# Hopsworks fallback to pull training data from the
+# aqi_karachi_features feature group.
+#
+# Place this file at: .github/workflows/training_pipeline.yml
+
+on:
+  schedule:
+    # 03:00 UTC daily -- a few hours after the last hourly feature-pipeline
+    # run of the day, so the freshest possible data is available. Adjust
+    # if you want a different time; GitHub Actions cron is UTC only.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab, for testing
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30  # RF + Ridge + TF training across 3 horizons should finish well under this; catches a hung run rather than burning CI minutes indefinitely
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run training pipeline
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+        run: python train_model.py
+
+      # Trained models are also registered in Hopsworks by train_model.py
+      # itself, but keeping them as a workflow artifact too makes a failed
+      # or suspicious run easy to inspect without touching Hopsworks --
+      # download from the run's Summary page in the Actions tab.
+      - name: Upload trained model artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models-${{ github.run_id }}
+          path: trained_models/
+          retention-days: 14

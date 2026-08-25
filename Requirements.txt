@@ -1,0 +1,7 @@
+hopsworks
+pandas
+numpy
+scikit-learn
+tensorflow
+joblib
+requests
