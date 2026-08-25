@@ -332,6 +332,23 @@ def main():
     row_df = pd.DataFrame([row])
     row_df[TIMESTAMP_COL] = pd.to_datetime(row_df[TIMESTAMP_COL], utc=True)
 
+    # The Hopsworks feature group's schema expects 'double' for every
+    # numeric column here (the backfill CSV that created it had NaNs
+    # mixed into these at various points, which upcasts a whole column to
+    # float64 -- but a single clean live row like this one, e.g.
+    # nh3=0 or aqi_index=3, gets inferred as int/bigint by pandas, which
+    # Hopsworks then rejects as a schema mismatch). Force float
+    # explicitly rather than relying on inference.
+    float_cols = [
+        "co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3",
+        "aqi_index_openweather_1to5", "aqi",
+        "aqi_change_rate", "pm25_change_rate",
+        "om_pm2_5", "om_pm10", "om_co", "om_no2", "om_so2", "om_o3", "om_us_aqi",
+        "pm25_source_diff", "pm25_source_diff_pct",
+    ]
+    for col in float_cols:
+        row_df[col] = row_df[col].astype(float)
+
     print(f"\nInserting into Hopsworks feature group {RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}...")
     fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
     fg.insert(row_df, write_options={"wait_for_job": False})
