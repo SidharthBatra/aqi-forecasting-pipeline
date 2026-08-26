@@ -81,7 +81,6 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import RidgeCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -348,7 +347,21 @@ def evaluate(y_true, y_pred):
     return rmse, mae, r2
 
 
+def _import_tf():
+    """Imported lazily so that modules which only need this file's
+    feature-engineering helpers (e.g. dashboard.py, deployed without
+    TensorFlow installed to keep Streamlit Cloud's free-tier build light --
+    Random Forest won all three horizons, so the dashboard never needs TF)
+    can import train_model.py without pulling in the full TF stack. Every
+    TF-specific function below calls this instead of a module-level
+    `import tensorflow as tf`."""
+    import tensorflow as tf
+
+    return tf
+
+
 def build_tf_model(n_features):
+    tf = _import_tf()
     model = tf.keras.Sequential(
         [
             tf.keras.layers.Input(shape=(n_features,)),
@@ -461,6 +474,7 @@ def train_horizon(df, horizon, feature_cols, most_recent_ts):
         )
 
     # --- TensorFlow Neural Net (reuses the Ridge scaler) ---
+    tf = _import_tf()
     tf_model = build_tf_model(X_train_s.shape[1])
     early_stop = tf.keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True)
     # Keras applies validation_split BEFORE shuffling/weighting by slicing
