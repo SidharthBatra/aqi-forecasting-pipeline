@@ -1,7 +1,9 @@
 hopsworks
+confluent-kafka
 pandas
+requests
 numpy
 scikit-learn
 tensorflow
 joblib
-requests
+pyarrow
