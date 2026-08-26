@@ -166,8 +166,20 @@ def load_models(_project):
         else:
             model = joblib.load(os.path.join(model_dir, "model.joblib"))
 
-        scaler_path = os.path.join(model_dir, "scaler.joblib")
-        scaler = joblib.load(scaler_path) if os.path.isfile(scaler_path) else None
+        # Random Forest never uses a scaler (see train_model.py's
+        # train_horizon(), which sets scaler=None for RF) -- but a model
+        # directory can still contain a STALE scaler.joblib left over from
+        # an earlier training run where the best model for this horizon was
+        # Ridge/TensorFlow instead. save_model_artifacts() only overwrites
+        # model.joblib/metadata.json on a rerun, it never deletes leftover
+        # files from a previous run's different model type, so that stale
+        # scaler (fit on a since-changed feature set) can still be sitting
+        # there. Only load it for model types that actually need one.
+        scaler = None
+        if model_type != "random_forest":
+            scaler_path = os.path.join(model_dir, "scaler.joblib")
+            if os.path.isfile(scaler_path):
+                scaler = joblib.load(scaler_path)
 
         models[h] = {
             "model": model,
