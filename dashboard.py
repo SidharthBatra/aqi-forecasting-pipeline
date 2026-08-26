@@ -213,27 +213,66 @@ def predict_horizon(model_info, feature_row):
 # SHAP (cached -- TreeExplainer setup + value computation is the slow part)
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Computing SHAP feature importance...")
-def compute_shap(_models, _engineered_df):
+def compute_shap(_models, _engineered_df, _current_row, current_row_timestamp):
     """TreeExplainer against Random Forest models only -- exact and fast for
     tree ensembles, unlike a model-agnostic explainer. All 3 horizons
     currently register a Random Forest as the best model (see each
     trained_models/aqi_forecast_*h/metadata.json), so this covers every
     horizon today; a horizon that later registers a Ridge/TensorFlow model
     instead is simply skipped here (SHAP's TreeExplainer doesn't apply, and
-    a slower KernelExplainer isn't worth the wait for a dashboard)."""
+    a slower KernelExplainer isn't worth the wait for a dashboard).
+
+    `current_row_timestamp` (the latest valid row's index, a plain
+    timestamp) is passed as an explicitly hashable arg purely so
+    st.cache_resource invalidates this cache whenever a new hourly reading
+    arrives -- `_current_row`/`_models`/`_engineered_df` are prefixed with
+    an underscore precisely so Streamlit skips hashing the unhashable
+    objects themselves, but that means the cache would otherwise never
+    know the input actually changed.
+
+    The aggregate (background-sample) SHAP values and the single-row
+    "current forecast" SHAP values are computed as two SEPARATE calls to
+    explainer.shap_values() -- deliberately, so the per-row waterfall chart
+    can never end up reusing (or being derived from) the aggregate
+    mean(|SHAP value|) array used for the summary bar chart above it."""
     results = {}
     for h, info in _models.items():
         if info["model_type"] != "random_forest":
             continue
         cols = info["feature_columns"]
-        sample = _engineered_df[cols].dropna()
-        # Cap the background sample -- SHAP's TreeExplainer is exact but
-        # still scales with sample size; a few hundred recent rows is
-        # plenty to characterize feature importance without a long wait.
-        sample = sample.tail(500)
         explainer = shap.TreeExplainer(info["model"])
-        explanation = explainer(sample)
-        results[h] = {"explainer": explainer, "sample": sample, "explanation": explanation}
+
+        # --- Aggregate background sample: summary bar chart only ---
+        background_sample = _engineered_df[cols].dropna().tail(500)
+        summary_shap_values = explainer.shap_values(background_sample)
+
+        # --- Single-row explanation for the CURRENT forecast: waterfall only ---
+        # `cols` (== feature_columns from metadata.json, produced by
+        # train_model.get_feature_columns()) fixes the exact column order
+        # the model was trained on; selecting _current_row[cols] guarantees
+        # this row is built in that same order before it ever reaches SHAP.
+        current_row_df = _current_row[cols].to_frame().T.astype(float)
+        current_shap_values = explainer.shap_values(current_row_df)[0]
+
+        # Sanity check: expected_value + sum(this row's shap values) should
+        # reconstruct the model's own prediction for this exact row. If it
+        # doesn't, the feature order fed to SHAP has drifted from the order
+        # the model was actually trained on -- surfaced as a warning in the
+        # UI rather than silently trusting a possibly-misaligned chart.
+        model_pred = float(info["model"].predict(current_row_df.to_numpy())[0])
+        reconstructed = float(explainer.expected_value) + float(np.sum(current_shap_values))
+        additivity_ok = abs(model_pred - reconstructed) <= max(1.0, 0.02 * abs(model_pred))
+
+        results[h] = {
+            "feature_columns": cols,
+            "background_sample": background_sample,
+            "summary_shap_values": summary_shap_values,
+            "current_shap_values": current_shap_values,
+            "expected_value": float(explainer.expected_value),
+            "model_prediction": model_pred,
+            "reconstructed_prediction": reconstructed,
+            "additivity_ok": additivity_ok,
+        }
     return results
 
 
@@ -268,8 +307,11 @@ def render_alert_banner(alert_result):
             unsafe_allow_html=True,
         )
     else:
+        # st.success() already renders its own leading icon (set via `icon`
+        # below) -- do NOT also prefix the message text with a checkmark
+        # character, or it renders twice.
         st.success(
-            "&#9989; No hazardous conditions: current AQI and all 24h/48h/72h "
+            "No hazardous conditions: current AQI and all 24h/48h/72h "
             "forecasts are below the Unhealthy threshold.",
             icon="✅",
         )
@@ -293,6 +335,13 @@ def render_current_conditions(latest_row):
     st.caption(f"As of {latest_row.name} (UTC)")
 
     st.markdown("**Pollutant breakdown (current reading, ug/m3)**")
+    st.caption(
+        "These are instantaneous readings for this hour. The AQI/category/"
+        "dominant pollutant above instead use EPA rolling-window averages "
+        "(24h for PM2.5/PM10, 8h for O3/CO -- see compute_true_aqi.py), so "
+        "the labeled dominant pollutant won't always match whichever value "
+        "looks highest below -- that's expected, not a bug."
+    )
     pollutants = ["pm2_5", "pm10", "o3", "no2", "so2", "co"]
     cols = st.columns(len(pollutants))
     for col, pol in zip(cols, pollutants):
@@ -370,7 +419,7 @@ def render_timeseries_chart(engineered_df, latest_row, predictions):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_shap_tab(shap_results, models):
+def render_shap_tab(shap_results):
     st.subheader("Model Insights: SHAP Feature Importance")
     st.caption(
         "SHAP values computed with TreeExplainer against each horizon's "
@@ -385,10 +434,9 @@ def render_shap_tab(shap_results, models):
     for tab, h in zip(tabs, shap_results.keys()):
         with tab:
             result = shap_results[h]
-            explanation = result["explanation"]
-            cols = result["sample"].columns.tolist()
+            cols = result["feature_columns"]
 
-            mean_abs = np.abs(explanation.values).mean(axis=0)
+            mean_abs = np.abs(result["summary_shap_values"]).mean(axis=0)
             importance = (
                 pd.Series(mean_abs, index=cols).sort_values(ascending=False).head(15)
             )
@@ -406,10 +454,25 @@ def render_shap_tab(shap_results, models):
             st.plotly_chart(bar_fig, use_container_width=True, key=f"shap_bar_{h}")
 
             st.markdown(f"**Why today's {h}h forecast is what it is**")
-            last_idx = len(explanation.values) - 1
-            row_values = explanation.values[last_idx]
+            if not result["additivity_ok"]:
+                st.warning(
+                    f"SHAP additivity check failed for the {h}h model: "
+                    f"expected_value + sum(shap values) = "
+                    f"{result['reconstructed_prediction']:.1f}, but the model's "
+                    f"actual prediction for this row is {result['model_prediction']:.1f}. "
+                    f"This usually means the feature order fed to SHAP has drifted "
+                    f"from train_model.py's get_feature_columns() order -- treat "
+                    f"this chart with caution until that's resolved."
+                )
+
+            # Per-instance, signed SHAP values for the CURRENT row only --
+            # a genuine mix of positive (pushes this forecast up) and
+            # negative (pushes it down) contributions, never derived from
+            # the aggregate mean(|SHAP value|) array used above.
             row_contrib = (
-                pd.Series(row_values, index=cols).sort_values(key=np.abs, ascending=True).tail(12)
+                pd.Series(result["current_shap_values"], index=cols)
+                .sort_values(key=np.abs, ascending=True)
+                .tail(12)
             )
             waterfall_fig = go.Figure(
                 go.Bar(
@@ -424,9 +487,13 @@ def render_shap_tab(shap_results, models):
             waterfall_fig.update_layout(
                 height=380,
                 margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="SHAP value (impact on predicted AQI)",
+                xaxis_title="SHAP value (red = pushes AQI up, blue = pushes AQI down)",
             )
             st.plotly_chart(waterfall_fig, use_container_width=True, key=f"shap_row_{h}")
+            st.caption(
+                f"Base value (average model output) = {result['expected_value']:.1f} "
+                f"-> this row's predicted AQI = {result['model_prediction']:.1f}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -498,8 +565,8 @@ def main():
         )
 
     with tab_insights:
-        shap_results = compute_shap(models, engineered_df)
-        render_shap_tab(shap_results, models)
+        shap_results = compute_shap(models, engineered_df, latest_row, latest_row.name)
+        render_shap_tab(shap_results)
 
 
 if __name__ == "__main__":
