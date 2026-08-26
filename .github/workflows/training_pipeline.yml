@@ -45,6 +45,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # TensorFlow is deliberately NOT in requirements.txt -- that file is
+      # also what the Streamlit Cloud dashboard deploy installs from, and
+      # TF is too heavy for its free tier (the dashboard doesn't need it
+      # anyway: Random Forest won all three horizons). But train_model.py
+      # unconditionally trains a TensorFlow model per horizon (see
+      # train_horizon()), so this training-only job needs it installed
+      # separately, here, rather than back in the shared requirements.txt.
+      - name: Install TensorFlow (training only, not in requirements.txt)
+        run: pip install tensorflow
+
       - name: Run training pipeline
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
