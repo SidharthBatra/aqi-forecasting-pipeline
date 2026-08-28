@@ -310,7 +310,7 @@ def _compute_shap_for_horizon(info, engineered_df, current_row):
         explainer.shap_values(current_row_df), len(cols)
     )[0]
 
-    model_pred = float(info["model"].predict(current_row_df.to_numpy())[0])
+    model_pred = _as_float(info["model"].predict(current_row_df.to_numpy()))
 
     # Sanity check: expected_value + sum(this row's shap values) should
     # reconstruct the model's own prediction for this exact row. If it
@@ -484,7 +484,7 @@ def render_timeseries_chart(engineered_df, latest_row, predictions):
         margin=dict(l=10, r=10, t=40, b=10),
         height=420,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_shap_tab(shap_results):
@@ -525,7 +525,7 @@ def render_shap_tab(shap_results):
                 )
             )
             bar_fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(bar_fig, use_container_width=True, key=f"shap_bar_{h}")
+            st.plotly_chart(bar_fig, width="stretch", key=f"shap_bar_{h}")
 
             st.markdown(f"**Why today's {h}h forecast is what it is**")
             if result["shap_check_error"]:
@@ -570,7 +570,7 @@ def render_shap_tab(shap_results):
                 margin=dict(l=10, r=10, t=10, b=10),
                 xaxis_title="SHAP value (red = pushes AQI up, blue = pushes AQI down)",
             )
-            st.plotly_chart(waterfall_fig, use_container_width=True, key=f"shap_row_{h}")
+            st.plotly_chart(waterfall_fig, width="stretch", key=f"shap_row_{h}")
             if result["expected_value"] is not None:
                 st.caption(
                     f"Base value (average model output) = {result['expected_value']:.1f} "
@@ -596,7 +596,7 @@ def main():
 
     top_l, top_r = st.columns([5, 1])
     with top_r:
-        if st.button("Refresh data", use_container_width=True):
+        if st.button("Refresh data", width="stretch"):
             st.cache_data.clear()
             st.cache_resource.clear()
             st.rerun()
