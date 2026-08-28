@@ -212,6 +212,40 @@ def predict_horizon(model_info, feature_row):
 # ---------------------------------------------------------------------------
 # SHAP (cached -- TreeExplainer setup + value computation is the slow part)
 # ---------------------------------------------------------------------------
+def _as_float(value):
+    """SHAP's expected_value may come back as a plain float, a 0-d array, a
+    shape-(1,) array, or a per-output array depending on SHAP/NumPy version
+    and model type; np.sum(...) similarly returns a NumPy scalar rather
+    than a Python float. NumPy 2.x (unlike 1.x) raises instead of silently
+    coercing an array to a scalar in float(...), which is what actually
+    crashed this on Streamlit Cloud's numpy==2.4.6 -- normalize everything
+    through here before any arithmetic or f-string formatting."""
+    arr = np.asarray(value)
+    return float(arr.reshape(-1)[0])
+
+
+def _as_2d_shap_array(raw, n_features):
+    """explainer.shap_values() can return a plain (n, f) ndarray, a list of
+    per-output (n, f) arrays, or an (n, f, outputs) ndarray depending on
+    the installed SHAP version -- these are all single-output regressors,
+    so wherever an "outputs" axis exists, only its first entry is real.
+    Normalizes to a plain 2-D (n, f) ndarray so downstream indexing/mean/
+    sum calls behave the same regardless of which shape SHAP handed back."""
+    if isinstance(raw, list):
+        raw = raw[0]
+    arr = np.asarray(raw)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.shape[-1] != n_features:
+        raise ValueError(
+            f"SHAP values have {arr.shape[-1]} features, expected {n_features} "
+            f"-- feature order may have drifted from get_feature_columns()."
+        )
+    return arr
+
+
 @st.cache_resource(show_spinner="Computing SHAP feature importance...")
 def compute_shap(_models, _engineered_df, _current_row, current_row_timestamp):
     """TreeExplainer against Random Forest models only -- exact and fast for
@@ -239,41 +273,75 @@ def compute_shap(_models, _engineered_df, _current_row, current_row_timestamp):
     for h, info in _models.items():
         if info["model_type"] != "random_forest":
             continue
-        cols = info["feature_columns"]
-        explainer = shap.TreeExplainer(info["model"])
-
-        # --- Aggregate background sample: summary bar chart only ---
-        background_sample = _engineered_df[cols].dropna().tail(500)
-        summary_shap_values = explainer.shap_values(background_sample)
-
-        # --- Single-row explanation for the CURRENT forecast: waterfall only ---
-        # `cols` (== feature_columns from metadata.json, produced by
-        # train_model.get_feature_columns()) fixes the exact column order
-        # the model was trained on; selecting _current_row[cols] guarantees
-        # this row is built in that same order before it ever reaches SHAP.
-        current_row_df = _current_row[cols].to_frame().T.astype(float)
-        current_shap_values = explainer.shap_values(current_row_df)[0]
-
-        # Sanity check: expected_value + sum(this row's shap values) should
-        # reconstruct the model's own prediction for this exact row. If it
-        # doesn't, the feature order fed to SHAP has drifted from the order
-        # the model was actually trained on -- surfaced as a warning in the
-        # UI rather than silently trusting a possibly-misaligned chart.
-        model_pred = float(info["model"].predict(current_row_df.to_numpy())[0])
-        reconstructed = float(explainer.expected_value) + float(np.sum(current_shap_values))
-        additivity_ok = abs(model_pred - reconstructed) <= max(1.0, 0.02 * abs(model_pred))
-
-        results[h] = {
-            "feature_columns": cols,
-            "background_sample": background_sample,
-            "summary_shap_values": summary_shap_values,
-            "current_shap_values": current_shap_values,
-            "expected_value": float(explainer.expected_value),
-            "model_prediction": model_pred,
-            "reconstructed_prediction": reconstructed,
-            "additivity_ok": additivity_ok,
-        }
+        try:
+            results[h] = _compute_shap_for_horizon(info, _engineered_df, _current_row)
+        except Exception as e:
+            # A genuine failure here (e.g. a SHAP/NumPy version combo this
+            # hasn't been tested against) should cost this ONE horizon's
+            # tab, not crash the whole Model Insights page for all three --
+            # render_shap_tab() checks for this key and shows a warning
+            # instead of a chart for this horizon.
+            results[h] = {"compute_error": f"{type(e).__name__}: {e}"}
     return results
+
+
+def _compute_shap_for_horizon(info, engineered_df, current_row):
+    """Computes both the aggregate background-sample SHAP values (for the
+    summary bar chart) and the single current-row SHAP values (for the
+    waterfall) for one horizon's Random Forest model. Raises on a genuine
+    failure -- the caller (compute_shap) catches per-horizon so one bad
+    horizon can't take down the other two."""
+    cols = info["feature_columns"]
+    explainer = shap.TreeExplainer(info["model"])
+
+    # --- Aggregate background sample: summary bar chart only ---
+    background_sample = engineered_df[cols].dropna().tail(500)
+    summary_shap_values = _as_2d_shap_array(
+        explainer.shap_values(background_sample), len(cols)
+    )
+
+    # --- Single-row explanation for the CURRENT forecast: waterfall only ---
+    # `cols` (== feature_columns from metadata.json, produced by
+    # train_model.get_feature_columns()) fixes the exact column order the
+    # model was trained on; selecting current_row[cols] guarantees this
+    # row is built in that same order before it ever reaches SHAP.
+    current_row_df = current_row[cols].to_frame().T.astype(float)
+    current_shap_values = _as_2d_shap_array(
+        explainer.shap_values(current_row_df), len(cols)
+    )[0]
+
+    model_pred = float(info["model"].predict(current_row_df.to_numpy())[0])
+
+    # Sanity check: expected_value + sum(this row's shap values) should
+    # reconstruct the model's own prediction for this exact row. If it
+    # doesn't, the feature order fed to SHAP has drifted from the order the
+    # model was actually trained on -- surfaced as a warning in the UI.
+    # This is a DIAGNOSTIC, not a requirement for the charts to render --
+    # wrapped so that a normalization edge case here (e.g. a SHAP/NumPy
+    # version combo this hasn't been tested against) can never take down
+    # the chart, only this one check.
+    expected_value = None
+    reconstructed = None
+    additivity_ok = None
+    shap_check_error = None
+    try:
+        expected_value = _as_float(explainer.expected_value)
+        reconstructed = expected_value + _as_float(np.sum(current_shap_values))
+        additivity_ok = abs(model_pred - reconstructed) <= max(1.0, 0.02 * abs(model_pred))
+    except Exception as e:
+        shap_check_error = f"{type(e).__name__}: {e}"
+
+    return {
+        "feature_columns": cols,
+        "background_sample": background_sample,
+        "summary_shap_values": summary_shap_values,
+        "current_shap_values": current_shap_values,
+        "expected_value": expected_value,
+        "model_prediction": model_pred,
+        "reconstructed_prediction": reconstructed,
+        "additivity_ok": additivity_ok,
+        "shap_check_error": shap_check_error,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +502,12 @@ def render_shap_tab(shap_results):
     for tab, h in zip(tabs, shap_results.keys()):
         with tab:
             result = shap_results[h]
+            if "compute_error" in result:
+                st.error(
+                    f"Couldn't compute SHAP values for the {h}h model: "
+                    f"{result['compute_error']}"
+                )
+                continue
             cols = result["feature_columns"]
 
             mean_abs = np.abs(result["summary_shap_values"]).mean(axis=0)
@@ -454,7 +528,14 @@ def render_shap_tab(shap_results):
             st.plotly_chart(bar_fig, use_container_width=True, key=f"shap_bar_{h}")
 
             st.markdown(f"**Why today's {h}h forecast is what it is**")
-            if not result["additivity_ok"]:
+            if result["shap_check_error"]:
+                st.warning(
+                    f"SHAP consistency check unavailable for the {h}h model "
+                    f"({result['shap_check_error']}) -- the chart below still "
+                    f"reflects the real per-row SHAP values, this just means "
+                    f"the base-value + sum reconstruction couldn't be computed."
+                )
+            elif not result["additivity_ok"]:
                 st.warning(
                     f"SHAP additivity check failed for the {h}h model: "
                     f"expected_value + sum(shap values) = "
@@ -490,10 +571,16 @@ def render_shap_tab(shap_results):
                 xaxis_title="SHAP value (red = pushes AQI up, blue = pushes AQI down)",
             )
             st.plotly_chart(waterfall_fig, use_container_width=True, key=f"shap_row_{h}")
-            st.caption(
-                f"Base value (average model output) = {result['expected_value']:.1f} "
-                f"-> this row's predicted AQI = {result['model_prediction']:.1f}"
-            )
+            if result["expected_value"] is not None:
+                st.caption(
+                    f"Base value (average model output) = {result['expected_value']:.1f} "
+                    f"-> this row's predicted AQI = {result['model_prediction']:.1f}"
+                )
+            else:
+                st.caption(
+                    f"Base value unavailable -- this row's predicted AQI = "
+                    f"{result['model_prediction']:.1f}"
+                )
 
 
 # ---------------------------------------------------------------------------
