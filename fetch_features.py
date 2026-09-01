@@ -47,6 +47,17 @@ NOTE: like the other Hopsworks-touching scripts written this session,
 this hasn't been run against your live project from this environment --
 only syntax-checked and logic-smoke-tested with synthetic context data.
 
+INCIDENT (2026-09-01): before the hour-flooring fix below existed, this
+script wrote 'timestamp_utc' straight from OpenWeather's 'dt' (real
+minutes/seconds, e.g. 12:17:33) instead of flooring to the hour like the
+backfill's History API rows. train_model.load_and_prepare_grid()'s exact
+hourly reindex silently dropped every one of those rows, so the pipeline
+ran green for days while contributing nothing -- see dashboard staleness
+investigation. The ~4 rows already inserted at misaligned timestamps are
+left in the feature group as harmless orphans (they still won't land on
+the hourly grid, so they're simply ignored by training/inference) rather
+than deleted or reinserted -- not worth the cleanup for 4 rows.
+
 Requires HOPSWORKS_API_KEY and OPENWEATHER_API_KEY as environment
 variables (GitHub Actions secrets in CI, Codespaces secrets locally).
 AQICN_API_TOKEN is optional -- if unset, the cross-check/staleness log is
@@ -109,7 +120,15 @@ def fetch_openweather():
         data = response.json()
         entry = data["list"][0]
         components = entry["components"]
+        # OpenWeather's 'dt' carries real minutes/seconds (e.g. 12:17:33),
+        # unlike the backfill's History API rows which land exactly on :00.
+        # train_model.load_and_prepare_grid() reindexes onto an EXACT hourly
+        # grid (pd.date_range(..., freq="h")) with no tolerance -- a row not
+        # sitting on :00 matches no grid point and is silently dropped
+        # during reindexing. Flooring here is what makes every downstream
+        # row actually land in the training grid instead of vanishing.
         dt = datetime.fromtimestamp(entry["dt"], tz=timezone.utc)
+        dt = dt.replace(minute=0, second=0, microsecond=0)
         return {
             "dt": dt,
             "aqi_index_openweather_1to5": entry["main"]["aqi"],
@@ -171,6 +190,13 @@ def fetch_aqicn():
 
 def fetch_recent_context(fs):
     """Pulls the last CONTEXT_HOURS from the Hopsworks feature group --
+    (verified: compute_true_aqi.compute_sub_indices()'s rolling windows are
+    time-based -- df[col].rolling("24h"/"8h", ...) -- not row-position
+    based, so they average over actual elapsed time regardless of whether
+    every timestamp in the context sits exactly on :00. The hour-flooring
+    fix above still matters for the *new* row this run writes -- but it
+    was never required for these rolling calcs to be correct.)
+
     this is the Hopsworks-backed replacement for the original script's
     local-file state, and supplies the history the EPA rolling-window
     calc and change-rate features both need. Empty DataFrame if the
@@ -238,6 +264,14 @@ def compute_change_rates(context_df, current_dt, current_aqi, current_pm25):
 
 def build_row(ow_data, context_df):
     dt = ow_data["dt"]
+    # Guard against this class of bug recurring silently: a misaligned
+    # timestamp here would be dropped without warning by
+    # train_model.load_and_prepare_grid()'s exact hourly reindex, and the
+    # pipeline would keep reporting success while contributing nothing.
+    assert dt.minute == 0 and dt.second == 0 and dt.microsecond == 0, (
+        f"Observation timestamp {dt.isoformat()} is not floored to the hour "
+        f"-- this row would be silently dropped by the training grid reindex."
+    )
     aqi, dominant, category = compute_live_aqi(context_df, ow_data)
     aqi_rate, pm25_rate = compute_change_rates(context_df, dt, aqi, ow_data.get("pm2_5"))
 
@@ -275,8 +309,13 @@ def build_row(ow_data, context_df):
         "aqi_category": category,
         "aqi_change_rate": aqi_rate,
         "pm25_change_rate": pm25_rate,
-        # Derived from the Unix timestamp, not sequential -- avoids any
-        # collision with the backfill's sequential 0..16751 row_ids.
+        # Derived from the (now hour-floored) Unix timestamp, not
+        # sequential -- avoids any collision with the backfill's sequential
+        # 0..16751 row_ids (a 2026 epoch-second value is ~1.78e9). Basing
+        # this on the floored dt makes it idempotent: re-running this
+        # script for an hour that already has a row reproduces the same
+        # row_id and upserts in place instead of inserting a near-duplicate
+        # row a few seconds/minutes apart.
         "row_id": int(dt.timestamp()),
     }
 

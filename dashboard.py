@@ -385,6 +385,26 @@ def render_alert_banner(alert_result):
         )
 
 
+def render_staleness_warning(latest_row, raw_df):
+    """Surfaces the gap between the newest row actually present in the raw
+    feature group and the newest row with complete-enough features to
+    score, instead of silently presenting an old timestamp as if it were
+    current. A materialization lag, a misaligned/dropped live row (see
+    train_model.load_and_prepare_grid()'s reindex-drop WARNING), or a
+    paused feature pipeline all show up here the same way: as a visible
+    gap, not a mystery."""
+    newest_raw_ts = raw_df[TIMESTAMP_COL].max()
+    gap = newest_raw_ts - latest_row.name
+    if gap > pd.Timedelta(hours=2):
+        st.warning(
+            f"Showing data as of {latest_row.name} (UTC) -- newer rows exist "
+            f"in the feature group up to {newest_raw_ts} (UTC), but don't "
+            f"have complete enough features to score yet (missing lag/"
+            f"rolling history, or the timestamp didn't land on the hourly "
+            f"grid). This is a real gap, not a display bug."
+        )
+
+
 def render_current_conditions(latest_row):
     st.subheader("Current Conditions")
     aqi_val = latest_row["aqi"]
@@ -630,6 +650,8 @@ def main():
 
     for h, err in pred_errors.items():
         st.warning(f"{h}h prediction failed: {err}")
+
+    render_staleness_warning(latest_row, raw_df)
 
     alert_readings = {"current": latest_row["aqi"]}
     alert_readings.update({f"{h}h": predictions.get(h) for h in HORIZONS})
