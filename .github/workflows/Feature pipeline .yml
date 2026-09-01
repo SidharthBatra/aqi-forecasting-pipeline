@@ -10,10 +10,20 @@ name: Hourly Feature Pipeline
 
 on:
   schedule:
-    # Hourly, on the hour, UTC. GitHub Actions cron can run a few minutes
-    # late under load -- that's fine, fetch_openweather() just gets
-    # whatever OpenWeather's latest reading is at call time.
-    - cron: "0 * * * *"
+    # Hourly, UTC. Deliberately NOT "0 * * * *" -- GitHub's own docs warn
+    # that the top of every hour is the highest-load instant for Actions
+    # schedules and queued runs can be silently dropped under load, with no
+    # failure/notification anywhere. INCIDENT (2026-09-01): with this cron
+    # at :00, the schedule trigger fired successfully exactly ONCE in the
+    # ~5 days after this workflow was added (2026-08-26 to 2026-09-01) --
+    # confirmed via the Actions API run history, which showed only 1
+    # `schedule`-triggered run out of 5 total (the rest were manual
+    # workflow_dispatch runs used for testing). That single dropped-cron
+    # problem, stacked with the timestamp-flooring bug fixed in
+    # fetch_features.py the same day, is why the feature group only ever
+    # had 4 live rows despite the pipeline reporting green. Running at :17
+    # instead avoids the contended top-of-hour slot.
+    - cron: "17 * * * *"
   workflow_dispatch: {}  # manual trigger from the Actions tab, for testing
 
 jobs:

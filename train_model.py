@@ -251,6 +251,7 @@ def load_and_prepare_grid(path=None):
     df = read_source_data()
     df = df.sort_values(TIMESTAMP_COL).drop_duplicates(subset=[TIMESTAMP_COL])
     df = df.set_index(TIMESTAMP_COL)
+    original_index = df.index
 
     full_index = pd.date_range(df.index.min(), df.index.max(), freq="h")
     n_missing = len(full_index) - len(df)
@@ -261,6 +262,22 @@ def load_and_prepare_grid(path=None):
     )
     df = df.reindex(full_index)
     df.index.name = TIMESTAMP_COL
+
+    # A row whose timestamp isn't exactly on :00 (e.g. a live-fetched row
+    # that slipped past fetch_features.py's hour-flooring) matches no point
+    # in full_index and is silently dropped by reindex() above -- the
+    # pipeline then looks healthy (no exception, no missing-hour gap
+    # reported) while quietly discarding real data. Catch that here instead
+    # of finding out from a stale dashboard days later, by comparing every
+    # input timestamp against the grid it was reindexed onto.
+    offenders = original_index.difference(full_index)
+    if len(offenders) > 0:
+        print(
+            f"  WARNING: {len(offenders)} input row(s) did not land on the "
+            f"hourly grid and were silently dropped by reindexing -- these "
+            f"timestamps are not exactly on :00. First offending timestamps: "
+            f"{sorted(offenders)[:5]}"
+        )
     return df
 
 
@@ -278,18 +295,58 @@ def add_time_features(df):
     return df
 
 
-def add_lag_and_rolling_features(df):
-    for lag in LAG_HOURS:
-        df[f"aqi_lag_{lag}h"] = df[TARGET_COL].shift(lag)
+# A LAG feature (shift(N)) reads a single exact past hour -- if that one
+# hour happens to be a gap placeholder, the lag feature goes NaN for that
+# row even though 40+ other hours of real context surround it. A rolling
+# MEAN/STD already tolerates a short gap gracefully (pandas skips NaNs
+# within the window, as long as min_periods is met), but the lag features
+# don't have an equivalent cushion. Interpolating short gaps before
+# computing lags (not the rolling calc, which didn't need it) closes that
+# hole without fabricating data across a genuinely long outage.
+#
+# FEATURE-SEMANTICS CHANGE: this changes the numeric value of the lag/
+# rolling features computed for any row that overlaps a short gap (both in
+# the historical backfill, which has 17 such gaps, and live). Both
+# training (train_model.main()) and serving (dashboard.py,
+# setup_feature_view.py) call this same function, so they can't drift from
+# each other -- but the currently-registered models were trained BEFORE
+# this change, on the old (non-interpolated) feature values. They must be
+# retrained (`python train_model.py`) after this change lands, or serving
+# and training are computing the same feature name from two different
+# definitions.
+GAP_INTERPOLATION_LIMIT_HOURS = 3
 
+
+def add_lag_and_rolling_features(df):
+    # Interpolate ONLY the series used to derive lag/rolling FEATURES, not
+    # the real df[TARGET_COL]/df["pm2_5"]/df["pm10"] columns themselves --
+    # those must stay genuinely NaN for a missing hour so the historical
+    # chart (dashboard.py's render_timeseries_chart) and
+    # get_latest_valid_row() never present a fabricated reading as real.
+    # limit_area="inside" additionally guarantees no extrapolation past the
+    # edges of the series (e.g. into not-yet-arrived hours).
+    target_filled = df[TARGET_COL].interpolate(
+        method="time", limit=GAP_INTERPOLATION_LIMIT_HOURS, limit_area="inside"
+    )
+
+    for lag in LAG_HOURS:
+        df[f"aqi_lag_{lag}h"] = target_filled.shift(lag)
+
+    # Time-based windows (explicit min_periods) rather than row-count
+    # windows -- equivalent on today's always-uniform hourly grid, but
+    # correct (rather than silently wrong) if this is ever run against
+    # data that isn't perfectly one-row-per-hour.
     for window in ROLLING_WINDOWS:
         min_p = max(3, window // 4)
-        df[f"aqi_rollmean_{window}h"] = df[TARGET_COL].rolling(window, min_periods=min_p).mean()
-        df[f"aqi_rollstd_{window}h"] = df[TARGET_COL].rolling(window, min_periods=min_p).std()
+        df[f"aqi_rollmean_{window}h"] = target_filled.rolling(f"{window}h", min_periods=min_p).mean()
+        df[f"aqi_rollstd_{window}h"] = target_filled.rolling(f"{window}h", min_periods=min_p).std()
 
     for pol in ["pm2_5", "pm10"]:
         if pol in df.columns:
-            df[f"{pol}_lag_24h"] = df[pol].shift(24)
+            pol_filled = df[pol].interpolate(
+                method="time", limit=GAP_INTERPOLATION_LIMIT_HOURS, limit_area="inside"
+            )
+            df[f"{pol}_lag_24h"] = pol_filled.shift(24)
 
     return df
 
