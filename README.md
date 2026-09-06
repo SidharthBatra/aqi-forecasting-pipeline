@@ -138,3 +138,6 @@ but still informative. The 72h model beats the naive persistence baseline
 but it should be read as a directional hint rather than a reliable
 forecast. The dashboard visually de-emphasizes the 72h forecast
 accordingly.
+
+# 📊 Project Overview
+You can read the full documentation here: **[Download the AQI Forecasting Final Report (PDF)](./AQI_Forecasting_Final_Report.pdf)**
