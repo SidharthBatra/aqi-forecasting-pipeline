@@ -128,9 +128,9 @@ registered models — all three are Random Forest:
 
 | Horizon | RMSE | MAE | R² |
 |---|---|---|---|
-| 24h | 11.79 | 6.65 | 0.71 |
-| 48h | 17.40 | 11.87 | 0.35 |
-| 72h | 20.49 | 15.02 | 0.08 |
+| 24h | 11.79 | 6.65 | 0.72 |
+| 48h | 17.40 | 11.87 | 0.36 |
+| 72h | 20.49 | 15.02 | 0.16 |
 
 The 24h model is a genuinely useful forecaster. The 48h model is weaker
 but still informative. The 72h model beats the naive persistence baseline
