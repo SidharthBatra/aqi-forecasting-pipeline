@@ -78,14 +78,30 @@ def check_alerts(readings):
           entries         -- list of {label, aqi, category, severity,
                               is_alert} for every valid input reading, in
                               the order given
+          missing_labels  -- list of labels whose reading was None (e.g. a
+                              horizon whose prediction failed). A caller
+                              MUST treat a non-empty missing_labels as "we
+                              cannot fully assess hazard" -- it must NEVER
+                              be silently absorbed into a "safe" verdict
+                              just because none of the readings that DID
+                              come through were alerting. (See dashboard.py
+                              render_alert_banner: a missing reading only
+                              yields "unavailable" when nothing else has
+                              already triggered; a confirmed hazard from
+                              the readings that DID come through must still
+                              win, since hiding a known hazard behind an
+                              "unavailable" caveat would be worse than
+                              showing it.)
     """
     entries = []
+    missing_labels = []
     max_severity = -1
     worst_label = None
     worst_category = None
 
     for label, aqi in readings.items():
         if aqi is None:
+            missing_labels.append(label)
             continue
         category = get_category(aqi)
         severity = get_severity(category)
@@ -109,4 +125,5 @@ def check_alerts(readings):
         "worst_label": worst_label,
         "worst_category": worst_category,
         "entries": entries,
+        "missing_labels": missing_labels,
     }

@@ -359,6 +359,13 @@ def category_badge_html(category, aqi_value=None):
 
 
 def render_alert_banner(alert_result):
+    # Three distinct states, checked in this order deliberately: a
+    # confirmed hazard from the readings that DID come through must win
+    # over "unavailable" (missing_labels), since hiding a known hazard
+    # behind an "unavailable" caveat would be worse than showing it. Only
+    # when NOTHING is alerting do missing readings block the reassuring
+    # message -- a failed/missing forecast must never fall through to "no
+    # hazardous conditions" just because nothing else happened to trigger.
     if alert_result["triggered"]:
         color = CATEGORY_COLORS.get(alert_result["worst_category"], "#ff0000")
         text_color = "#000000" if CATEGORY_SEVERITY.get(alert_result["worst_category"], 0) <= 2 else "#ffffff"
@@ -373,6 +380,13 @@ def render_alert_banner(alert_result):
             </div>
             """,
             unsafe_allow_html=True,
+        )
+    elif alert_result["missing_labels"]:
+        st.warning(
+            "Forecast unavailable, cannot assess hazard level -- missing/"
+            f"failed reading(s): {', '.join(alert_result['missing_labels'])}. "
+            "This is NOT a confirmation that conditions are safe.",
+            icon="⚠️",
         )
     else:
         # st.success() already renders its own leading icon (set via `icon`

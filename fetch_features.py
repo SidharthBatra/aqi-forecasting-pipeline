@@ -58,6 +58,19 @@ left in the feature group as harmless orphans (they still won't land on
 the hourly grid, so they're simply ignored by training/inference) rather
 than deleted or reinserted -- not worth the cleanup for 4 rows.
 
+SELF-HEALING (2026-09-05): GitHub Actions scheduled runs are best-effort
+and get silently dropped under load, so a run missing a few hours is
+expected, not exceptional -- manually re-running backfill_gap.py every
+time was not sustainable and let the dashboard silently re-break between
+manual runs. Every run now reconciles rather than blindly appending one
+row: it reads the newest hour-aligned row with a non-null 'aqi' from the
+feature group first (see reconcile_missing_hours() below), and if it's
+more than an hour behind, backfills the missing hours (capped at
+MAX_HEAL_HOURS per run -- see that constant) using the exact same
+OpenWeather-fetch + trailing-context rolling-aqi logic as
+backfill_gap.py/backfill_historical.py, reused rather than duplicated,
+before fetching and inserting the current hour as usual.
+
 Requires HOPSWORKS_API_KEY and OPENWEATHER_API_KEY as environment
 variables (GitHub Actions secrets in CI, Codespaces secrets locally).
 AQICN_API_TOKEN is optional -- if unset, the cross-check/staleness log is
@@ -99,6 +112,17 @@ RAW_FEATURE_GROUP_VERSION = 4
 # How far back to pull for the EPA rolling-window context. 30h gives
 # margin over the 24h PM2.5/PM10 window even if an hour or two is missing.
 CONTEXT_HOURS = 30
+
+# Cap on how many hours of gap a single run will heal (see
+# reconcile_missing_hours()). GitHub Actions scheduled runs are
+# best-effort and can be dropped, so a gap of a few hours is routine --
+# but an unbounded healing job (e.g. after a days-long outage) run inside
+# a scheduled hourly job could turn one run into an unexpectedly long,
+# rate-limit-heavy OpenWeather History API job. 168h = 1 week: generous
+# enough to absorb any realistic missed-run streak, small enough to bound
+# a single run's runtime/API usage. A gap larger than this heals over
+# multiple runs (this many hours per run) rather than all at once.
+MAX_HEAL_HOURS = 168
 
 # AQICN ground stations update on a multi-hour cycle (per the mentor's
 # brief) -- flag a station reading older than this as stale rather than
@@ -188,35 +212,86 @@ def fetch_aqicn():
         return None
 
 
-def fetch_recent_context(fs):
-    """Pulls the last CONTEXT_HOURS from the Hopsworks feature group --
-    (verified: compute_true_aqi.compute_sub_indices()'s rolling windows are
-    time-based -- df[col].rolling("24h"/"8h", ...) -- not row-position
-    based, so they average over actual elapsed time regardless of whether
-    every timestamp in the context sits exactly on :00. The hour-flooring
-    fix above still matters for the *new* row this run writes -- but it
-    was never required for these rolling calcs to be correct.)
+def reconcile_missing_hours(fg):
+    """Reconciliation step run at the top of every hourly pipeline run
+    (see module docstring's SELF-HEALING note): reads the full feature
+    group, detects any gap since the newest hour-aligned row with a
+    non-null 'aqi' (reusing backfill_gap.determine_gap() -- the exact
+    logic backfill_gap.py used to run by hand), and if one exists,
+    backfills it via backfill_gap.build_gap_rows() -- the SAME
+    OpenWeather-fetch + trailing-context EPA rolling-aqi logic
+    backfill_gap.py/backfill_historical.py use, reused rather than
+    reimplemented so a healed stretch's first hours get their 'aqi' from
+    the same trailing-context window, not a truncated one.
 
-    this is the Hopsworks-backed replacement for the original script's
-    local-file state, and supplies the history the EPA rolling-window
-    calc and change-rate features both need. Empty DataFrame if the
-    feature group has no rows yet or the read fails (script still runs;
-    compute_live_aqi() degrades to using only this hour's reading)."""
+    Capped at MAX_HEAL_HOURS per run -- a gap beyond the cap heals
+    partially this run (logged loudly) and the rest on a later run,
+    rather than turning one scheduled run into an unbounded OpenWeather
+    History API job.
+
+    Returns (full_df, n_healed): full_df is the feature group's data with
+    any newly-inserted gap rows already appended (so the caller can use
+    it as rolling-window context for the live row without re-reading from
+    Hopsworks), and n_healed is how many hours were backfilled. Returns
+    (empty df, 0) if the feature group can't be read at all -- the caller
+    then computes the live row's 'aqi' from this hour's reading alone,
+    same degraded behavior as before this reconciliation step existed."""
     try:
-        fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
         df = fg.read()
         df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=CONTEXT_HOURS)
-        recent = df[df[TIMESTAMP_COL] >= cutoff].sort_values(TIMESTAMP_COL)
-        print(f"  Pulled {len(recent)} rows of context from the last {CONTEXT_HOURS}h.")
-        return recent
     except Exception as e:
         print(
-            f"  WARNING: couldn't read recent context from Hopsworks "
-            f"({type(e).__name__}: {e}) -- computing 'aqi' from this hour's "
-            f"reading alone, with no rolling-window history."
+            f"  WARNING: couldn't read the feature group from Hopsworks "
+            f"({type(e).__name__}: {e}) -- skipping gap healing and computing "
+            f"this hour's 'aqi' from this hour's reading alone, with no "
+            f"rolling-window history."
         )
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
+
+    from backfill_gap import build_gap_rows, determine_gap
+
+    gap = determine_gap(df)
+    if gap is None:
+        print("  WARNING: no hour-aligned row with a non-null 'aqi' found in the "
+              "feature group -- can't determine a gap. Skipping healing.")
+        return df, 0
+    newest_valid_ts, gap_start, now_floored = gap
+    if gap_start > now_floored:
+        print("  No gap: feature group is already current through this hour.")
+        return df, 0
+
+    total_gap_hours = int((now_floored - gap_start).total_seconds() // 3600) + 1
+    fill_end = now_floored
+    if total_gap_hours > MAX_HEAL_HOURS:
+        fill_end = gap_start + timedelta(hours=MAX_HEAL_HOURS - 1)
+        remaining_hours = total_gap_hours - MAX_HEAL_HOURS
+        print(
+            f"  GAP DETECTED: {total_gap_hours}h missing ({gap_start.isoformat()} -> "
+            f"{now_floored.isoformat()}), exceeding the {MAX_HEAL_HOURS}h per-run "
+            f"healing cap. Healing {gap_start.isoformat()} -> {fill_end.isoformat()} "
+            f"this run; {remaining_hours}h will REMAIN MISSING and should heal on "
+            f"subsequent run(s)."
+        )
+    else:
+        print(
+            f"  GAP DETECTED: {total_gap_hours}h missing "
+            f"({gap_start.isoformat()} -> {now_floored.isoformat()}). Healing in full this run."
+        )
+
+    gap_df = build_gap_rows(df, newest_valid_ts, gap_start, fill_end)
+    if gap_df.empty:
+        print("  No gap rows returned to insert -- nothing healed.")
+        return df, 0
+
+    print(
+        f"  Inserting {len(gap_df)} backfilled hour(s) into "
+        f"{RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}..."
+    )
+    fg.insert(gap_df, write_options={"wait_for_job": False})
+
+    combined = pd.concat([df, gap_df], ignore_index=True)
+    combined = combined.sort_values(TIMESTAMP_COL).drop_duplicates(subset=[TIMESTAMP_COL], keep="last")
+    return combined, len(gap_df)
 
 
 def compute_live_aqi(context_df, ow_data):
@@ -330,8 +405,12 @@ def main():
     print("Connecting to Hopsworks...")
     project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
     fs = project.get_feature_store()
+    fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
 
-    print("Fetching from OpenWeather (primary)...")
+    print("Reconciling any missing hours since the last recorded run...")
+    full_df, n_healed = reconcile_missing_hours(fg)
+
+    print("\nFetching from OpenWeather (primary)...")
     ow_data = fetch_openweather()
 
     print("Fetching from AQICN (cross-check / staleness only)...")
@@ -359,8 +438,13 @@ def main():
         )
         sys.exit(0)  # a documented skipped hour, not a pipeline failure
 
-    print(f"\nPulling last {CONTEXT_HOURS}h of context from Hopsworks...")
-    context_df = fetch_recent_context(fs)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=CONTEXT_HOURS)
+    if not full_df.empty:
+        context_df = full_df[full_df[TIMESTAMP_COL] >= cutoff].sort_values(TIMESTAMP_COL)
+    else:
+        context_df = full_df
+    print(f"  Using {len(context_df)} row(s) of context from the last {CONTEXT_HOURS}h "
+          f"(includes any hour(s) just healed above) for this hour's rolling-window calc.")
 
     row = build_row(ow_data, context_df)
 
@@ -389,9 +473,13 @@ def main():
         row_df[col] = row_df[col].astype(float)
 
     print(f"\nInserting into Hopsworks feature group {RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}...")
-    fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
     fg.insert(row_df, write_options={"wait_for_job": False})
     print("Insert submitted.")
+
+    print(
+        f"\nRUN SUMMARY: {n_healed} backfilled hour(s) healed via gap "
+        f"reconciliation, 1 live hour inserted ({row[TIMESTAMP_COL]})."
+    )
 
 
 if __name__ == "__main__":

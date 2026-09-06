@@ -1,10 +1,17 @@
 """
 backfill_gap.py
 
-One-off targeted gap-fill for aqi_karachi_features v4. Does NOT re-run the
-full 2-year backfill -- it fetches only the missing window between the
-newest row with a real (non-NaN) 'aqi' and now, and inserts those rows
-into the EXISTING feature group.
+Targeted gap-fill for aqi_karachi_features v4: fetches only the missing
+window between the newest row with a real (non-NaN) 'aqi' and now, and
+inserts those rows into the EXISTING feature group. Does NOT re-run the
+full 2-year backfill.
+
+ROUTINE HEALING NOW LIVES IN fetch_features.py: the hourly pipeline
+reconciles this same gap (capped per run, see fetch_features.MAX_HEAL_HOURS)
+on every scheduled run via determine_gap()/build_gap_rows() below, so this
+script no longer needs to be run by hand after a normal missed-run gap.
+It's kept for one-off use -- e.g. healing a gap larger than the pipeline's
+per-run cap in one shot, or investigating/backfilling manually.
 
 Why this exists: fetch_features.py originally wrote 'timestamp_utc' from
 OpenWeather's live 'dt' field without flooring to the hour, so every live
@@ -77,57 +84,84 @@ def fetch_gap_window(gap_start, gap_end):
     return all_rows
 
 
-def main():
-    if not HOPSWORKS_API_KEY:
-        print("ERROR: HOPSWORKS_API_KEY not set.")
-        sys.exit(1)
-    if not OPENWEATHER_API_KEY:
-        print("ERROR: OPENWEATHER_API_KEY not set.")
-        sys.exit(1)
+# How far back to scan for missing hours, not just check the trailing
+# edge. Comfortably covers train_model.py's ROLLING_WINDOWS (max 168h) and
+# LAG_HOURS (max 72h) -- any hole that could actually break a lag/rolling
+# feature falls inside this window -- without scanning the entire 2+ year
+# history on every run.
+#
+# WHY A SCAN, NOT JUST "is the newest row stale": GitHub Actions scheduled
+# runs fail INDEPENDENTLY of each other, so real-world gaps are usually
+# scattered single/few-hour holes interleaved with runs that DID succeed
+# (confirmed directly: 2026-09-01 onward has isolated hour-aligned rows
+# every 3-9h, not one contiguous trailing block) -- not one clean block
+# right before "now". A check that only looks at "now - newest row" would
+# find the newest row current (a later run succeeded) and report no gap
+# at all, silently leaving every one of those interior holes unfilled
+# forever.
+GAP_SCAN_LOOKBACK_HOURS = 24 * 10
 
-    import hopsworks
 
-    print("Connecting to Hopsworks...")
-    project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
-    fs = project.get_feature_store()
-    fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
+def determine_gap(df, lookback_hours=GAP_SCAN_LOOKBACK_HOURS):
+    """Given the full raw feature group df (with TIMESTAMP_COL already
+    parsed to UTC datetimes), scans the trailing `lookback_hours` of the
+    hourly grid for the EARLIEST hour missing a non-null 'aqi' reading,
+    and returns (newest_valid_ts, gap_start, now_floored) where
+    newest_valid_ts is the newest valid hour strictly before that gap
+    (the anchor for trailing rolling-window context; None if there's no
+    valid hour before it at all).
 
-    print(f"Reading {RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}...")
-    df = fg.read()
-    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
-    print(f"  {len(df)} rows read.")
+    A hour-misaligned row (a pre-flooring-fix live row, see
+    fetch_features.py) can carry a non-null 'aqi' yet still not occupy any
+    slot on the hourly grid load_and_prepare_grid() reindexes onto -- it
+    must NOT count as "coverage" here, or a real hole reads as "already
+    current".
 
-    # --- 1. Determine the gap empirically ---
-    # A hour-misaligned row (a pre-flooring-fix live row, see
-    # fetch_features.py) can carry a non-null 'aqi' yet still not occupy any
-    # slot on the hourly grid load_and_prepare_grid() reindexes onto -- it
-    # must NOT count as "coverage" here, or the gap start gets computed past
-    # a timestamp that was never actually on the grid, and a real multi-day
-    # hole reads as "already current".
+    Returns None ONLY if no hour-aligned row in the WHOLE feature group
+    has a non-null 'aqi' at all (e.g. the group is empty -- run
+    backfill_historical.py first). If the lookback window has no gap,
+    still returns a tuple, with gap_start > now_floored -- callers already
+    treat that as "nothing to backfill", so "no valid data anywhere" stays
+    the only case a caller needs to handle as a distinct error."""
     hour_aligned = (df[TIMESTAMP_COL].dt.minute == 0) & (df[TIMESTAMP_COL].dt.second == 0)
     valid = df[df["aqi"].notna() & hour_aligned]
     if valid.empty:
-        print("ERROR: no hour-aligned row in the feature group has a non-null 'aqi' -- "
-              "can't determine a gap start. Run backfill_historical.py first.")
-        sys.exit(1)
-    newest_valid_ts = valid[TIMESTAMP_COL].max()
-    gap_start = newest_valid_ts + timedelta(hours=1)
+        return None
+
     now_floored = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    window_start = now_floored - timedelta(hours=lookback_hours - 1)
+    valid_hours = set(valid[TIMESTAMP_COL])
+    expected_hours = pd.date_range(window_start, now_floored, freq="h", tz="UTC")
+    missing_hours = [h for h in expected_hours if h not in valid_hours]
+    newest_valid_overall = valid[TIMESTAMP_COL].max()
+    if not missing_hours:
+        return newest_valid_overall, now_floored + timedelta(hours=1), now_floored
 
-    print(
-        f"\nNewest row with a real 'aqi': {newest_valid_ts.isoformat()}\n"
-        f"Resolved gap window to fetch: {gap_start.isoformat()} -> {now_floored.isoformat()}"
-    )
-    if gap_start > now_floored:
-        print("Nothing to backfill -- already current.")
-        return
+    gap_start = min(missing_hours)
+    prior_valid = valid[valid[TIMESTAMP_COL] < gap_start]
+    newest_valid_ts = prior_valid[TIMESTAMP_COL].max() if not prior_valid.empty else None
+    return newest_valid_ts, gap_start, now_floored
 
-    # --- 2. Fetch the gap window from OpenWeather (reusing backfill_historical.py) ---
-    print("\nFetching gap window from OpenWeather History API...")
-    gap_rows = fetch_gap_window(gap_start, now_floored)
+
+def build_gap_rows(df, newest_valid_ts, gap_start, gap_end):
+    """Fetches [gap_start, gap_end] from OpenWeather, computes the EPA
+    rolling-window 'aqi' for those rows using trailing context pulled from
+    `df` (the existing feature group data, up through newest_valid_ts),
+    and returns a fully schema-matched, insert-ready DataFrame -- empty if
+    there was nothing to insert. Does NOT insert into Hopsworks; callers
+    decide when/whether to call fg.insert() on the result.
+
+    `df` must already have TIMESTAMP_COL parsed to UTC datetimes. Shared
+    by backfill_gap.py's one-off CLI and fetch_features.py's per-run
+    healing so both computes the "trailing-context rolling window" exactly
+    the same way -- get this wrong and the first hours of a healed stretch
+    get a wrong 'aqi' from a truncated window."""
+    print(f"\nFetching gap window from OpenWeather History API: "
+          f"{gap_start.isoformat()} -> {gap_end.isoformat()}...")
+    gap_rows = fetch_gap_window(gap_start, gap_end)
     if not gap_rows:
-        print("No records returned for the gap window -- nothing to insert.")
-        return
+        print("  No records returned for the gap window -- nothing to insert.")
+        return pd.DataFrame()
 
     gap_df = pd.DataFrame(gap_rows)
     gap_df[TIMESTAMP_COL] = pd.to_datetime(gap_df[TIMESTAMP_COL], utc=True)
@@ -137,33 +171,41 @@ def main():
     # single misbehaving record can't silently reintroduce the alignment
     # bug this whole gap exists because of.
     gap_df[TIMESTAMP_COL] = gap_df[TIMESTAMP_COL].dt.floor("h")
-    gap_df = gap_df[(gap_df[TIMESTAMP_COL] >= gap_start) & (gap_df[TIMESTAMP_COL] <= now_floored)]
+    gap_df = gap_df[(gap_df[TIMESTAMP_COL] >= gap_start) & (gap_df[TIMESTAMP_COL] <= gap_end)]
     gap_df = gap_df.drop_duplicates(subset=[TIMESTAMP_COL], keep="last").sort_values(TIMESTAMP_COL)
     if gap_df.empty:
-        print("No in-window records after filtering -- nothing to insert.")
-        return
+        print("  No in-window records after filtering -- nothing to insert.")
+        return gap_df
     print(f"  {len(gap_df)} gap-window rows to insert, "
           f"{gap_df[TIMESTAMP_COL].min().isoformat()} -> {gap_df[TIMESTAMP_COL].max().isoformat()}")
 
-    # --- 5. Compute rolling AQI WITH trailing context from Hopsworks ---
+    # --- Compute rolling AQI WITH trailing context from Hopsworks ---
     # The EPA aqi for the first ~24h of gap rows depends on the 24h
     # PRECEDING them, which live in the existing backfill, not in what was
     # just fetched. Pull that trailing context straight from the feature
     # group (already-cleaned, already-correct data) rather than re-hitting
     # OpenWeather for it.
-    context_cutoff = newest_valid_ts - timedelta(hours=CONTEXT_HOURS - 1)
     context_cols = [TIMESTAMP_COL] + list(POLLUTANT_COLUMNS.values())
-    context_df = df[(df[TIMESTAMP_COL] >= context_cutoff) & (df[TIMESTAMP_COL] <= newest_valid_ts)][context_cols].copy()
-    print(f"\nUsing {len(context_df)} rows of trailing context "
-          f"({context_cutoff.isoformat()} -> {newest_valid_ts.isoformat()}) "
-          f"for the rolling-window aqi calc.")
+    if newest_valid_ts is not None:
+        context_cutoff = newest_valid_ts - timedelta(hours=CONTEXT_HOURS - 1)
+        context_df = df[(df[TIMESTAMP_COL] >= context_cutoff) & (df[TIMESTAMP_COL] <= newest_valid_ts)][context_cols].copy()
+        print(f"  Using {len(context_df)} rows of trailing context "
+              f"({context_cutoff.isoformat()} -> {newest_valid_ts.isoformat()}) "
+              f"for the rolling-window aqi calc.")
+    else:
+        # No valid hour exists before this gap at all (e.g. an empty/very
+        # young feature group) -- compute the rolling window from a cold
+        # start using only the gap's own fetched data.
+        context_df = pd.DataFrame(columns=context_cols)
+        print("  No prior valid hour found -- computing the rolling-window aqi "
+              "from a cold start (gap data only, no trailing context).")
 
     combined = pd.concat([context_df, gap_df[context_cols]], ignore_index=True)
     combined = combined.sort_values(TIMESTAMP_COL).drop_duplicates(subset=[TIMESTAMP_COL], keep="last")
     combined = clean_sentinel_values(combined)
     combined_indexed = combined.set_index(TIMESTAMP_COL)
 
-    print("Computing EPA sub-indices over the concatenated (context + gap) series...")
+    print("  Computing EPA sub-indices over the concatenated (context + gap) series...")
     sub_indices = compute_sub_indices(combined_indexed)
     aqi = sub_indices.max(axis=1)
     dominant = sub_indices.idxmax(axis=1)
@@ -199,7 +241,7 @@ def main():
     # the same row_id rather than duplicating it).
     gap_df["row_id"] = gap_df[TIMESTAMP_COL].apply(lambda ts: int(ts.timestamp()))
 
-    # --- 3. Assert hour-alignment before insert ---
+    # --- Assert hour-alignment before insert ---
     misaligned = gap_df[TIMESTAMP_COL].dt.minute.ne(0) | gap_df[TIMESTAMP_COL].dt.second.ne(0)
     assert not misaligned.any(), (
         f"{int(misaligned.sum())} gap row(s) are not hour-aligned -- refusing to insert. "
@@ -222,10 +264,54 @@ def main():
               f"calc (missing pollutant inputs from OpenWeather for that hour) -- "
               f"these insert as documented gaps, same as fetch_features.py would.")
 
+    return gap_df
+
+
+def main():
+    if not HOPSWORKS_API_KEY:
+        print("ERROR: HOPSWORKS_API_KEY not set.")
+        sys.exit(1)
+    if not OPENWEATHER_API_KEY:
+        print("ERROR: OPENWEATHER_API_KEY not set.")
+        sys.exit(1)
+
+    import hopsworks
+
+    print("Connecting to Hopsworks...")
+    project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
+    fs = project.get_feature_store()
+    fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
+
+    print(f"Reading {RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}...")
+    df = fg.read()
+    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
+    print(f"  {len(df)} rows read.")
+
+    gap = determine_gap(df)
+    if gap is None:
+        print("ERROR: no hour-aligned row in the feature group has a non-null 'aqi' -- "
+              "can't determine a gap start. Run backfill_historical.py first.")
+        sys.exit(1)
+    newest_valid_ts, gap_start, now_floored = gap
+
+    newest_valid_str = newest_valid_ts.isoformat() if newest_valid_ts is not None else "(none before this gap)"
+    print(
+        f"\nNewest valid hour before the gap: {newest_valid_str}\n"
+        f"Resolved gap window to fetch: {gap_start.isoformat()} -> {now_floored.isoformat()}"
+    )
+    if gap_start > now_floored:
+        print("Nothing to backfill -- already current.")
+        return
+
+    gap_df = build_gap_rows(df, newest_valid_ts, gap_start, now_floored)
+    if gap_df.empty:
+        return
+    n_aqi_nan = int(gap_df["aqi"].isna().sum())
+
     print(f"\nInserting {len(gap_df)} rows into {RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}...")
     fg.insert(gap_df, write_options={"wait_for_job": False})
 
-    # --- 7. Summary ---
+    # --- Summary ---
     print("\n" + "=" * 60)
     print("GAP-FILL SUMMARY")
     print("=" * 60)
